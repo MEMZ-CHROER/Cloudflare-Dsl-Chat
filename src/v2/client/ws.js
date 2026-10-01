@@ -29,6 +29,14 @@ export function connectWebSocket(roomName, password) {
     reconnectAttempts = 0;
     const token = localStorage.getItem("chat_token") || "";
     ws.send(JSON.stringify({ name: state.user?.name || "Guest", token }));
+    // Fetch online users after connecting
+    fetch("/api/room/" + encodeURIComponent(roomName) + "/users")
+      .then(r => r.json())
+      .then(data => {
+        if (data.users) patch({ onlineUsers: data.users });
+      })
+      .catch(e => console.error("[v2] Failed to fetch users:", e));
+
   };
 
   ws.onmessage = (event) => {
@@ -167,13 +175,14 @@ function handleLegacyMessage(msg) {
   console.log("[v2] legacy-msg", msg.type, msg);
 }
 
-export function sendMessage(content) {
+export function sendMessage(content, options) {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     console.error("[v2] WS not connected");
     return false;
   }
-  // v2 envelope with message field (server expects data.message)
-  ws.send(JSON.stringify({ v: "v2", t: "msg", d: { message: content } }));
+  const msg = { message: content };
+  if (options?.color) msg.color = options.color;
+  ws.send(JSON.stringify(msg));
   return true;
 }
 
