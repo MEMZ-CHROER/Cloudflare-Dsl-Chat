@@ -1,18 +1,23 @@
 /**
- * v2 WebSocket manager — handles connection lifecycle
+ * v2 WebSocket manager — handles v2 envelope protocol + legacy v1 messages
  */
 import { state, set, subscribe, patch } from "./store.js";
+import { addSystemMessage, initOnlineUsersListener, loadMessages } from "./chat.js";
 
 let ws = null;
+let msgSubscription = null;
+let connSubscription = null;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
 
-export function connectWebSocket(roomName) {
-  if (ws) {
-    ws.close();
-    ws = null;
-  }
+export function connectWebSocket(roomName, password) {
+  if (ws) { ws.close(); ws = null; }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  reconnectAttempts = 0;
 
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  const wsUrl = `${protocol}://${location.host}/api/room/${encodeURIComponent(roomName)}/websocket`;
+  let wsUrl = `${protocol}//${location.host}/api/room/${encodeURIComponent(roomName)}/websocket`;
+  if (password) wsUrl += `?password=${encodeURIComponent(password)}`;
   console.log(`[v2] connecting to ${wsUrl}`);
 
   ws = new WebSocket(wsUrl);
@@ -21,21 +26,27 @@ export function connectWebSocket(roomName) {
   ws.onopen = () => {
     console.log("[v2] WS connected");
     patch({ connected: true });
-    ws.send(JSON.stringify({ type: "v2-init", room: roomName }));
+    reconnectAttempts = 0;
+    const token = localStorage.getItem("chat_token") || "";
+    ws.send(JSON.stringify({ name: state.user?.name || "Guest", token }));
   };
 
   ws.onmessage = (event) => {
     const data = event.data;
     try {
       const msg = JSON.parse(data);
-      handleWSMessage(msg);
+      if (msg.v === "v2") {
+        handleV2Message(msg.t, msg.d);
+      } else {
+        handleLegacyMessage(msg);
+      }
     } catch {
-      console.log("[v2] raw message:", data);
+      console.log("[v2] raw:", data);
     }
   };
 
-  ws.onerror = (error) => {
-    console.error("[v2] WS error:", error);
+  ws.onerror = () => {
+    console.error("[v2] WS error");
     patch({ connected: false });
   };
 
@@ -43,29 +54,117 @@ export function connectWebSocket(roomName) {
     console.log("[v2] WS closed");
     patch({ connected: false });
     set("ws", null);
+    // Auto-reconnect after 3s
+    reconnectTimer = setTimeout(() => {
+      if (state.currentRoom && !state._manualDisconnect) {
+        console.log("[v2] reconnecting...");
+        connectWebSocket(state.currentRoom);
+      }
+    }, 3000);
   };
 }
 
-function handleWSMessage(msg) {
-  switch (msg.type) {
+function handleV2Message(type, data) {
+  switch (type) {
     case "msg":
-      patch({ messages: [...state.messages, msg] });
+      patch({ messages: [...state.messages, data] });
       break;
     case "join":
-      console.log("[v2] user joined:", msg.name);
-      break;
-    case "leave":
-      console.log("[v2] user left:", msg.name);
+    case "quit":
+      addSystemMessage(`${data.name || data.quit} ${type === "join" ? "加入了" : "离开了"}房间`);
       break;
     case "user-list":
-      patch({ onlineUsers: msg.users });
+      patch({ onlineUsers: data.users });
       break;
     case "system":
-      console.log("[v2] system:", msg.content);
+      addSystemMessage(data.content);
+      break;
+    case "destroyed":
+      addSystemMessage("房间已销毁");
       break;
     default:
-      console.log("[v2] unknown message type:", msg.type);
+      console.log("[v2] v2-msg", type, data);
   }
+}
+
+function handleLegacyMessage(msg) {
+  // Chat message
+  if (msg.message || msg.content) {
+    const chatMsg = {
+      id: msg.id || Date.now(),
+      name: msg.name || "Anonymous",
+      tag: msg.tag,
+      tagColor: msg.tagColor,
+      tagBorder: msg.tagBorder,
+      content: msg.message || msg.content,
+      timestamp: msg.timestamp || Date.now(),
+      channel: msg.channel,
+      type: msg.type || "msg",
+    };
+    patch({ messages: [...state.messages, chatMsg] });
+    return;
+  }
+  // Join
+  if (msg.joined) {
+    addSystemMessage(`${msg.joined} 加入了房间`);
+    return;
+  }
+  if (msg.quit) {
+    addSystemMessage(`${msg.quit} 离开了房间`);
+    return;
+  }
+  // Ready
+  if (msg.ready) {
+    console.log("[v2] connected, ready");
+    return;
+  }
+  // Channel info
+  if (msg.type === "channels") return;
+  if (msg.type === "pinned") return;
+  if (msg.type === "level-styles") return;
+  // Destroyed
+  if (msg.type === "destroyed") {
+    addSystemMessage("房间已销毁");
+    return;
+  }
+  // Image
+  if (msg.type === "image") {
+    const chatMsg = {
+      id: msg.timestamp || Date.now(),
+      name: msg.name || "Anonymous",
+      tag: msg.tag,
+      tagColor: msg.tagColor,
+      tagBorder: msg.tagBorder,
+      content: msg.url || msg.path || "[图片]",
+      timestamp: msg.timestamp || Date.now(),
+      channel: msg.channel,
+      type: "image",
+    };
+    patch({ messages: [...state.messages, chatMsg] });
+    return;
+  }
+  // GH card
+  if (msg.type === "gh-card") {
+    const chatMsg = {
+      id: Date.now(),
+      name: msg.name || "System",
+      tag: msg.tag,
+      tagColor: msg.tagColor,
+      tagBorder: msg.tagBorder,
+      content: msg.repo || msg.repoUrl || "",
+      timestamp: Date.now(),
+      channel: msg.channel,
+      type: "gh-card",
+    };
+    patch({ messages: [...state.messages, chatMsg] });
+    return;
+  }
+  // Error
+  if (msg.error) {
+    addSystemMessage("错误: " + msg.error);
+    return;
+  }
+  console.log("[v2] legacy-msg", msg.type, msg);
 }
 
 export function sendMessage(content) {
@@ -73,15 +172,15 @@ export function sendMessage(content) {
     console.error("[v2] WS not connected");
     return false;
   }
-  ws.send(JSON.stringify({ type: "msg", content }));
+  // v2 envelope with message field (server expects data.message)
+  ws.send(JSON.stringify({ v: "v2", t: "msg", d: { message: content } }));
   return true;
 }
 
 export function disconnect() {
-  if (ws) {
-    ws.close();
-    ws = null;
-    patch({ connected: false });
-    set("ws", null);
-  }
+  state._manualDisconnect = true;
+  if (ws) { ws.close(); ws = null; }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  patch({ connected: false });
+  set("ws", null);
 }
